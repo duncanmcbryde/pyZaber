@@ -1,0 +1,7 @@
+*.pyc
+*.swp
+pyzaber/scripts
+pyzaber/gui_step
+dist
+build
+Source
