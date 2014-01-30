@@ -128,7 +128,7 @@ class zaber_multidevice(zaber_device):
 
         self.enqueue(command, argument, self.base_commands)
 
-    def move(self, move_command, argument=None):
+    def move(self, move_command, argument=None, blocking=False):
         ''' zaber_multidevice.move(move_command, argument=None)
 
         This function enqueues a move command
@@ -151,8 +151,13 @@ class zaber_multidevice(zaber_device):
                 print 'enqueuing: %s, move %s (%i): addresses  %s' % \
                         (self.id, move_command, \
                         self.move_commands[move_command], str(argument))
+
+            if blocking:
+                self.do_now(self.move_commands[move_command], argument, 
+                        blocking=True)
+            else:
+                self.enqueue(move_command, argument, self.move_commands)
             
-            self.enqueue(move_command, argument, self.move_commands)
         else:
             if self.verbose:
                 for n in range(0,self.meta_command_depth):
@@ -166,7 +171,14 @@ class zaber_multidevice(zaber_device):
                 microstep_movements[each_device] = int(float(argument[each_device])\
                                                         * self.devices[each_device].microsteps_per_unit)
 
-            self.enqueue(move_command, microstep_movements, self.move_commands)
+            if blocking:
+
+                for each_device in argument:
+                    self.devices[each_device].move(move_command, 
+                            argument[each_device], blocking=True)
+            else:
+                self.enqueue(move_command, microstep_movements, 
+                        self.move_commands)
 
         return None
 
@@ -198,7 +210,7 @@ class zaber_multidevice(zaber_device):
         return position
 
     def do_now(self, command, data = None, pause_after = None, 
-            blocking = False, release_command = None):
+            blocking=False, release_command = None, timeout=40.0):
         '''zaber_multidevice.do_now(command, data = None, pause_after = None, 
                 blocking = False, release_command = None)
 
@@ -238,7 +250,7 @@ class zaber_multidevice(zaber_device):
         for each_device in data:
             try:
                 self.devices[each_device].do_now(command, data[each_device], \
-                        pause_after, blocking, release_command)
+                        pause_after, blocking, release_command, timeout)
             except KeyError:
                 # ignore invalid keys
                 pass

@@ -2,14 +2,18 @@ import serial
 import struct
 import signal
 from threading import Thread,Event
-from Queue import Queue,Empty
+from Queue import Queue, Empty
 from warnings import *
+import time
 
 PARITY_NONE, PARITY_EVEN, PARITY_ODD = 'N', 'E', 'O'
 STOPBITS_ONE, STOPBITS_TWO = (1, 2)
 FIVEBITS, SIXBITS, SEVENBITS, EIGHTBITS = (5,6,7,8)
 
 GENERAL, DEVICE, MALFORMED = (0x00,0x01,0x02)
+
+class TimeoutError(Exception):
+    pass
 
 class serial_connection():
     """serial_connection (default = None, data_block_format = '<2Bi', packet_q = None)
@@ -81,8 +85,25 @@ class serial_connection():
         self.running = Event()
         self.running.clear()
         
+        self._data_block_format = data_block_format
+        self._port = port
+
+        self._setup_serial()
+
+        # Initialise handler dictionary.
+        self.handler_list = {}
+
+        # Initialise device dictionary. This stores the association between
+        # device IDs and handler IDs.
+        self.device_list = {}
+
+        self.default_handler_id = 1
+
+    def _setup_serial(self):
+
         # Initialise serial port
-        self.io = async_serial(port, data_block_format, self.packet_q)
+        self.io = async_serial(self._port, self._data_block_format, 
+                self.packet_q)
         
         # Find what the format of the data_block is
         data_block_size_bytes = self.io.struct.size
@@ -98,19 +119,27 @@ class serial_connection():
         # replies during hardware initialisation
         self.io.open()
 
-        # Initialise handler dictionary.
-        self.handler_list = {}
-
-        # Initialise device dictionary. This stores the association between
-        # device IDs and handler IDs.
-        self.device_list = {}
-
-        self.default_handler_id = 1
 
     def __del__(self):
 
         # Exit tidily, shutting down connections etc
         self.close()
+
+    def reset(self):
+        '''Reset the various bits if the state gets messed up.
+        '''
+        while not self.packet_q.empty():
+            try:
+                self.packet_q.get()
+            except Empty:
+                pass
+
+        self.io.close()
+        self._setup_serial()
+
+        # Let things settle down for a bit.
+        time.sleep(2.0)
+
 
     def send_command(self, device_id, command, data = 0):
         """ serial_connection.send_command(device_id, command, data = 0)
@@ -286,7 +315,7 @@ class serial_connection():
         """
         return data_block
 
-    def queue_handler(self, packets_to_handle=None):
+    def queue_handler(self, packets_to_handle=None, timeout=40.0):
         """ serial_connection.queue_handler()
         Function to handle the queue. This is the function that blocks
         until data is available on the queue. It inspects packets as they
@@ -298,8 +327,16 @@ class serial_connection():
         else:
             block = False
 
+        start_time = time.time()
         try:
             while block or packets_to_handle > 0 :
+
+                if not block and time.time() - start_time > timeout:
+                    print('No packet arrived for a long time. Resetting...')
+                    self.reset()
+                    raise TimeoutError('No packet arrived for a long time. '
+                            'Is it lost?')
+
                 try:
                     if self.should_exit:
                         break
@@ -349,12 +386,6 @@ class serial_connection():
             raise KeyboardInterrupt
             return None
 
-        except Exception as inst:
-            print type(inst)
-            print inst
-            
-            self.close()
-            raise inst
 
         return None
 
@@ -399,6 +430,7 @@ class serial_connection():
         self.io.close()
         self.running.clear()
         print '\nGoodbye from the serial connection!'
+
 
 class async_serial(Thread):
     def __init__(self,
@@ -460,6 +492,17 @@ class async_serial(Thread):
         self.serial.flushInput()
         self.running.set()
         self.start()
+
+    def reset(self):
+        '''Reset the serial connection if the state gets messed up.
+        '''
+        self.serial.flushInput()
+        self.serial.flushOutput()
+        while not self.read_q.empty():
+            try:
+                self.read_q.get()
+            except Empty:
+                pass
     
     def write(self, data):
         '''Write a packet to the serial bus.
@@ -495,7 +538,7 @@ class async_serial(Thread):
 
 class basic_test:
     def __init__(self):
-        self.async_serial = async_serial('/dev/ttyUSB0', '<2Bi')
+        self.async_serial = async_serial('/http://ubuntuforums.org/showthread.php?t=1050533dev/ttyUSB0', '<2Bi')
         self.async_serial.open()
 
 def main(argv):

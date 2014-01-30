@@ -161,39 +161,41 @@ class device_base():
         self.stop_on_move_error = True
 
     def __getattr__(self, attr):
-        
+
         if self.base_commands.has_key(attr):
-            def base_function(data = 0):
+            def base_function(data=0, **kwargs):
                 return self.enqueue_base_command(attr, data)
 
             return base_function
 
         elif attr[0:5] == 'move_' and self.move_commands.has_key(attr[5:]):
-            def move_function(data = 0):
-                return self.move(attr[5:], data)
+            def move_function(data=0, blocking=False):
+                return self.move(attr[5:], data, blocking=blocking)
 
             return move_function 
         
         elif attr[0:4] == 'set_' and self.setting_commands.has_key(attr[4:]):
-            def set_function(data = 0):
+            def set_function(data=0, **kwargs):
                 return self.set(attr[4:], data)
+
+            print 'Set function!'
 
             return set_function
 
         elif attr[0:4] == 'get_' and self.setting_commands.has_key(attr[4:]):
-            def get_function(blocking = False):
-                return self.get(attr[4:], blocking = blocking)
+            def get_function(blocking=False, **kwargs):
+                return self.get(attr[4:], blocking=blocking)
 
             return get_function
 
         elif self.meta_commands.has_key(attr):
-            def do_function(data = 0):
+            def do_function(data=0, **kwargs):
                 return self.meta(attr, self.meta_commands[attr])
 
             return do_function
         
         elif self.user_meta_commands.has_key(attr):
-            def do_function(data = 0):
+            def do_function(data=0, **kwargs):
                 return self.meta(attr, self.user_meta_commands[attr])
 
             return do_function
@@ -210,7 +212,7 @@ class device_base():
         '''
         return self.id
 
-    def step(self):
+    def step(self, timeout=40.0):
         '''device_base.step()
 
         This function executes the next command in the command queue.
@@ -229,10 +231,19 @@ class device_base():
                 print 'Command queue empty for receive step command'
         elif self.in_action() and self.run_mode == STEP \
                 and not self.connection.running.isSet():
-            # Device is in the action state and the queue handler isn't running,
-            # so we need to manually pull a packet off the queue 
-            # (which will block until something is there)
-            self.connection.queue_handler(1)
+
+            try:
+                # Device is in the action state and the queue handler isn't running,
+                # so we need to manually pull a packet off the queue 
+                # (which will block until something is there)
+                self.connection.queue_handler(1, timeout=timeout)
+            except TimeoutError:
+                # We should recover. We assume that the packet got lost or 
+                # corrupted or something and so we try again with a stop command.
+                self.move_stop()
+                apply(self.do_now, self.command_queue.pop(0), 
+                        {'timeout': timeout})
+
         elif self.in_action() and self.run_mode == STEP:
             # We need to do something when we're no longer in action
             # so notify the packet handler of this
@@ -328,7 +339,7 @@ class device_base():
 
         return True
 
-    def get(self, setting, blocking = False):
+    def get(self, setting, blocking=False):
         ''' device_base.get(setting, blocking = False)
         
         Exit quietly. This attribute should be overwritten in child classes.
@@ -364,7 +375,7 @@ class device_base():
 
         return None
 
-    def move(self, move_command, argument):
+    def move(self, move_command, argument, blocking=False):
         ''' device_base.move(move_command, argument)
         
         Exit quietly. This attribute should be overwritten in child classes.
@@ -529,7 +540,7 @@ class device_base():
         return None
 
     def do_now(self, command, data = None, pause_after = True, 
-            blocking = False, release_command = None):
+            blocking = False, release_command = None, timeout=40.0):
         ''' device_base.do_now(command, data = None, pause_after = True, 
                     blocking = False, release_command = None)
             
@@ -792,7 +803,7 @@ class zaber_device(device_base):
             if self.error_list.count(setting) == preexisting_errors:
                 return self.settings[setting]
             else:
-                self.error_list.remove(command)
+                self.error_list.remove(setting)
                 attempt = attempt + 1
 
         return None
@@ -812,7 +823,7 @@ class zaber_device(device_base):
         self.do_now(self.setting_commands[setting], value, blocking = True)
         return None
 
-    def move(self, move_command, argument):
+    def move(self, move_command, argument, blocking=False):
         ''' zaber_device.move(move_command, argument)
 
         Move the device using the command move_command with the supplied argument.
@@ -823,6 +834,12 @@ class zaber_device(device_base):
         SOMETHING.
         '''
 
+        if blocking:
+            # Firstly we need to know how many errors are already on the
+            # error list
+            preexisting_errors = self.error_list.count(
+                    self.move_commands[move_command])
+
         if move_command == 'stored_position':
             if self.verbose:
                 for n in range(0,self.meta_command_depth):
@@ -831,8 +848,13 @@ class zaber_device(device_base):
                 print 'enqueuing: %s, move %s (%i): address %i' % \
                         (self.id, move_command, \
                         self.move_commands[move_command], data)
-           
-            self.enqueue(move_command, argument, self.move_commands)
+
+            if blocking:
+                command = lambda: self.do_now(self.move_commands[move_command], 
+                        argument, blocking=blocking)
+            else:
+                command = lambda: self.enqueue(move_command, argument, 
+                        self.move_commands)
         else:
             if self.verbose:
                 for n in range(0,self.meta_command_depth):
@@ -843,12 +865,33 @@ class zaber_device(device_base):
 
             microstep_movement = int(float(argument) * self.microsteps_per_unit)
             
-            self.enqueue(move_command, microstep_movement, self.move_commands)
+            if blocking:
+                command = lambda: self.do_now(self.move_commands[move_command], 
+                        microstep_movement, blocking=blocking)
+            else:
+                command = lambda: self.enqueue(move_command, microstep_movement, 
+                        self.move_commands)
+
+        attempt = 1
+        while ((not blocking and attempt == 1) or 
+                (blocking and attempt < self.blocking_retries)):
+            # If we are blocking, keep trying until we don't
+            # receive an error up to self.blocking_retries times
+            command()
+
+            # See if we have received a satisfactory response and leave when we do            
+            if (self.error_list.count(self.move_commands[move_command]) == 
+                    preexisting_errors):
+                return
+            else:
+                self.error_list.remove(self.move_commands[move_command])
+                attempt = attempt + 1
             
         return None
     
     def do_now(self, command, data = None, pause_after = True, 
-            blocking = False, release_command = None, emergency = False):
+            blocking = False, release_command = None, emergency = False, 
+            timeout=40.0):
         '''zaber_device.do_now(command, data = None, pause_after = True,
             blocking = False, release_command = None, emergency = False)
 
@@ -874,6 +917,9 @@ class zaber_device(device_base):
         If the emergency flag is True, the command is broadcast to every device
         immediately, no more questions asked, then return immediately.
         '''
+
+        if command in move_commands:
+            command = move_commands['command']
         
         if data == None:
             data = 0
@@ -953,7 +999,13 @@ class zaber_device(device_base):
             while self.last_packet_received == None or \
                     not self.last_packet_received[1] == release_command:
                 if self.responses_pending():
-                    self.connection.queue_handler(1)
+                    try:
+                        self.connection.queue_handler(1, timeout=timeout)
+                    except TimeoutError:
+                        # Stop now and try to let it recover from that.
+                        self.pending_responses = 0
+                        self.move_stop()
+                        apply(self.do_now, self.command_queue.pop(0))
                 else:
                     self.error_list.append(command)
                     break
